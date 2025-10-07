@@ -1,5 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi
 uvicorn[standard]
 opencv-python
 numpy
 pydantic
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
+torchaudio==2.3.1+cpu
+ultralytics
+pillow
+requests
