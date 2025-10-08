@@ -114,32 +114,41 @@ async def analyze_tree(
     manual_stick: str = Form(None)
 ):
     try:
-        # === Читаем изображение ===
+        # === Загружаем изображение ===
         image_data = await file.read()
         np_img = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
         local_path = os.path.join(IMAGE_UPLOAD_PATH, file.filename)
         cv2.imwrite(local_path, img)
 
-        # === Поиск палки ===
+        # === Попытка автоматического поиска палки ===
         results_stick = yolo_stick(img)
-        stick_boxes = results_stick[0].boxes.xyxy.cpu().numpy()
+        stick_boxes = results_stick[0].boxes.xyxy.cpu().numpy() if len(results_stick) > 0 else []
+
         stick_status = ""
         scale_m_per_px = None
 
         if len(stick_boxes) > 0:
-            x1, y1, x2, y2 = stick_boxes[0]
-            stick_length_px = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            # берём самую длинную найденную палку (по площади)
+            lengths = []
+            for (x1, y1, x2, y2) in stick_boxes:
+                lengths.append(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+            i = int(np.argmax(lengths))
+            x1, y1, x2, y2 = stick_boxes[i]
+            stick_length_px = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
             scale_m_per_px = stick_length_m / stick_length_px
-            stick_status = "✅ Палка найдена, масштаб вычислен."
+            stick_status = "✅ Палка найдена автоматически моделью YOLO."
         elif manual_stick:
-            pts = manual_stick.split(",")
-            x1, y1, x2, y2 = map(float, pts)
-            stick_length_px = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-            scale_m_per_px = stick_length_m / stick_length_px
-            stick_status = "✋ Палка отмечена вручную."
+            # === Палка указана вручную ===
+            pts = list(map(float, manual_stick.split(",")))
+            if len(pts) == 4:
+                x1, y1, x2, y2 = pts
+                stick_length_px = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                scale_m_per_px = stick_length_m / stick_length_px
+                stick_status = "✋ Палка указана вручную."
         else:
-            stick_status = "⚠️ Палка не найдена — масштаб вычислить невозможно."
+            stick_status = "⚠️ Палка не найдена — масштаб можно задать вручную."
+            scale_m_per_px = None
 
         # === Анализ дерева ===
         results_tree = yolo_tree(img)
