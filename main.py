@@ -1,91 +1,110 @@
-from fastapi import FastAPI, File, UploadFile, Form, Body
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 import numpy as np
 import cv2
 import os
-import shutil
+import json
 import requests
-import torch
 
-app = FastAPI(title="Tree Risk Analyzer — AI Forest Tool")
+app = FastAPI(title="🌲 Tree Risk Analyzer — Smart Forestry AI")
 
-# ======= Пути к моделям =======
+# ========== Настройки ==========
 TREE_MODEL_PATH = "tree_model.pt"
 STICK_MODEL_PATH = "stick_model.pt"
-CLASSIFIER_PATH = "classifier.pth"
-
-# ======= Пути данных =======
-DATASET_PATH = "datasets/new_train"
-IMAGE_UPLOAD_PATH = os.path.join(DATASET_PATH, "images")
-MASK_UPLOAD_PATH = os.path.join(DATASET_PATH, "masks")
+DATASET_PATH = "datasets"
+IMAGE_UPLOAD_PATH = os.path.join(DATASET_PATH, "uploads")
 os.makedirs(IMAGE_UPLOAD_PATH, exist_ok=True)
-os.makedirs(MASK_UPLOAD_PATH, exist_ok=True)
 
-# ======= OpenWeather =======
-OPENWEATHER_API_KEY = "dc825ffd002731568ec7766eafb54bc9"  # ← вставь сюда API ключ из openweathermap.org
-# ======= Yandex Disk =======
-YANDEX_TOKEN = "ТВОЙ_OAUTH_ТОКЕН"  # вставь, если хочешь выгрузку
+# ========== API ключи ==========
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+DRIVE_FOLDER_NAME = os.getenv("DRIVE_FOLDER_NAME", "TreeAppUploads")
+DRIVE_SHARE_WITH = os.getenv("DRIVE_SHARE_WITH", "")
 
-# ======= МОДЕЛИ =======
-print("Загрузка YOLO моделей...")
+# ========== Инициализация моделей ==========
+print("📦 Загрузка моделей YOLO...")
 yolo_tree = YOLO(TREE_MODEL_PATH)
 yolo_stick = YOLO(STICK_MODEL_PATH)
-print("Модели загружены!")
+print("✅ Модели загружены успешно!")
 
 
-# =========================================================
-# =============== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ =================
-# =========================================================
+# ========== Google Drive ==========
 
-def get_weather(lat: float, lon: float):
+def get_drive_service():
+    """Создание Google Drive service через ENV JSON"""
+    info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=['https://www.googleapis.com/auth/drive.file'])
+    return build('drive', 'v3', credentials=creds)
+
+
+def ensure_drive_folder(service):
+    """Создаёт папку на Google Drive (если её нет) и расшаривает на указанный Gmail"""
+    q = f"name='{DRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    res = service.files().list(q=q, fields='files(id,name)').execute()
+    files = res.get('files', [])
+    if files:
+        return files[0]['id']
+
+    meta = {'name': DRIVE_FOLDER_NAME, 'mimeType': 'application/vnd.google-apps.folder'}
+    folder = service.files().create(body=meta, fields='id').execute()
+    folder_id = folder['id']
+
+    if DRIVE_SHARE_WITH:
+        perm = {'type': 'user', 'role': 'writer', 'emailAddress': DRIVE_SHARE_WITH}
+        service.permissions().create(
+            fileId=folder_id, body=perm, fields='id', sendNotificationEmail=False).execute()
+
+    return folder_id
+
+
+def upload_to_drive(file_path, filename):
+    """Загрузка файла на Google Drive"""
+    try:
+        service = get_drive_service()
+        folder_id = ensure_drive_folder(service)
+        metadata = {'name': filename, 'parents': [folder_id]}
+        media = MediaFileUpload(file_path, resumable=True)
+        file = service.files().create(
+            body=metadata, media_body=media, fields='id,webViewLink').execute()
+        return {"status": "uploaded", "file_id": file.get('id'), "webViewLink": file.get('webViewLink')}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ========== Погода ==========
+
+def get_weather(lat, lon):
+    """Получение скорости и направления ветра"""
     try:
         url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
-        r = requests.get(url)
-        data = r.json()
-        wind_speed = data["wind"]["speed"]
-        wind_deg = data["wind"]["deg"]
-        return {"wind_speed": wind_speed, "wind_deg": wind_deg}
+        res = requests.get(url).json()
+        return {
+            "wind_speed": res["wind"]["speed"],
+            "wind_deg": res["wind"]["deg"],
+            "temp": res["main"]["temp"],
+            "desc": res["weather"][0]["description"]
+        }
     except Exception as e:
         return {"error": str(e)}
 
 
+# ========== Расчёт риска ==========
 def calculate_risk(height_m, crown_width_m, trunk_diameter_m, wind_speed):
-    try:
-        ratio = crown_width_m / max(trunk_diameter_m, 0.01)
-        wind_factor = wind_speed / 10
-        risk = (ratio * wind_factor * (height_m / 10))
-        risk = min(risk, 1.0)
-        if risk < 0.3:
-            category = "Low"
-        elif risk < 0.7:
-            category = "Medium"
-        else:
-            category = "High"
-        return {"risk": round(risk, 2), "category": category}
-    except Exception as e:
-        return {"error": str(e)}
+    if height_m == 0 or crown_width_m == 0:
+        return {"risk": 0, "category": "No tree detected"}
+    ratio = crown_width_m / max(trunk_diameter_m, 0.1)
+    wind_factor = wind_speed / 10
+    risk = min(ratio * wind_factor * (height_m / 10), 1.0)
+    category = "Low" if risk < 0.3 else "Medium" if risk < 0.7 else "High"
+    return {"risk": round(risk, 2), "category": category}
 
 
-def upload_to_yandex(filename: str, file_path: str):
-    """Загрузка файла на Яндекс Диск"""
-    try:
-        headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-        url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
-        params = {"path": f"/TreeApp/{filename}", "overwrite": "true"}
-        upload_url = requests.get(url, headers=headers, params=params).json()["href"]
-        with open(file_path, "rb") as f:
-            requests.put(upload_url, files={"file": f})
-        return True
-    except Exception as e:
-        print("Yandex upload error:", e)
-        return False
-
-
-# =========================================================
-# ======================= /analyze ========================
-# =========================================================
-
+# ========== Основной анализ ==========
 @app.post("/analyze")
 async def analyze_tree(
     file: UploadFile = File(...),
@@ -94,38 +113,39 @@ async def analyze_tree(
     stick_length_m: float = Form(1.0),
     manual_stick: str = Form(None)
 ):
-    """Основной анализ дерева"""
     try:
-        # Сохраняем фото
+        # === Читаем изображение ===
         image_data = await file.read()
         np_img = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-
         local_path = os.path.join(IMAGE_UPLOAD_PATH, file.filename)
         cv2.imwrite(local_path, img)
 
-        # --- ПАЛКА ---
+        # === Поиск палки ===
         results_stick = yolo_stick(img)
         stick_boxes = results_stick[0].boxes.xyxy.cpu().numpy()
+        stick_status = ""
+        scale_m_per_px = None
+
         if len(stick_boxes) > 0:
             x1, y1, x2, y2 = stick_boxes[0]
             stick_length_px = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            scale_m_per_px = stick_length_m / stick_length_px
+            stick_status = "✅ Палка найдена, масштаб вычислен."
         elif manual_stick:
             pts = manual_stick.split(",")
             x1, y1, x2, y2 = map(float, pts)
             stick_length_px = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-        else:
-            stick_length_px = None
-
-        if stick_length_px:
             scale_m_per_px = stick_length_m / stick_length_px
+            stick_status = "✋ Палка отмечена вручную."
         else:
-            scale_m_per_px = 0.002  # запасное значение
+            stick_status = "⚠️ Палка не найдена — масштаб вычислить невозможно."
 
-        # --- ДЕРЕВО ---
+        # === Анализ дерева ===
         results_tree = yolo_tree(img)
         boxes = results_tree[0].boxes.xyxy.cpu().numpy()
-        if len(boxes) > 0:
+
+        if len(boxes) > 0 and scale_m_per_px:
             x1, y1, x2, y2 = boxes[0]
             height_px = y2 - y1
             crown_width_px = x2 - x1
@@ -135,79 +155,25 @@ async def analyze_tree(
         else:
             height_m = crown_width_m = trunk_diameter_m = 0
 
-        # --- Погода и риск ---
+        # === Погода ===
         weather = get_weather(lat, lon)
         wind_speed = weather.get("wind_speed", 5.0)
+
+        # === Риск ===
         risk = calculate_risk(height_m, crown_width_m, trunk_diameter_m, wind_speed)
 
-        # --- Загрузка в облако ---
-        if YANDEX_TOKEN != "ТВОЙ_OAUTH_ТОКЕН":
-            upload_to_yandex(file.filename, local_path)
+        # === Загрузка в Google Drive ===
+        drive_upload = upload_to_drive(local_path, file.filename)
 
         return {
-            "scale_m_per_px": round(scale_m_per_px, 6),
+            "stick_status": stick_status,
             "height_m": round(height_m, 2),
             "crown_width_m": round(crown_width_m, 2),
             "trunk_diameter_m": round(trunk_diameter_m, 2),
+            "risk": risk,
             "weather": weather,
-            "risk": risk
+            "cloud_upload": drive_upload
         }
 
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-# =========================================================
-# ================= /upload_training_sample ===============
-# =========================================================
-
-@app.post("/upload_training_sample")
-async def upload_training_sample(file: UploadFile = File(...)):
-    """Загружает фото для обучения"""
-    try:
-        file_path = os.path.join(IMAGE_UPLOAD_PATH, file.filename)
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        return {"status": "uploaded", "filename": file.filename}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-# =========================================================
-# ======================= /save_polygon ===================
-# =========================================================
-
-@app.post("/save_polygon")
-async def save_polygon(data: dict = Body(...)):
-    """Сохраняет контур (маску), который нарисовал пользователь"""
-    try:
-        filename = data["filename"]
-        points = np.array(data["points"], np.int32)
-        mask = np.zeros((1024, 1024), dtype=np.uint8)
-        cv2.fillPoly(mask, [points], 255)
-        save_path = os.path.join(MASK_UPLOAD_PATH, f"{filename.split('.')[0]}.png")
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        cv2.imwrite(save_path, mask)
-        return {"status": "mask_saved", "path": save_path}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# =========================================================
-# ======================== /train_now =====================
-# =========================================================
-
-@app.post("/train_now")
-async def train_now():
-    """Запускает дообучение YOLO"""
-    try:
-        model = YOLO(TREE_MODEL_PATH)
-        results = model.train(
-            data=f"{DATASET_PATH}/data.yaml",
-            epochs=3,
-            imgsz=640,
-            device="cpu"
-        )
-        return {"status": "success", "details": str(results)}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
